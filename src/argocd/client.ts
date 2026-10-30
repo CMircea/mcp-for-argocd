@@ -8,19 +8,20 @@ import {
   V1alpha1ResourceDiff,
   V1alpha1ResourceResult,
   V1alpha1ApplicationResourceResult,
-  V1alpha1ClusterList
+  V1alpha1ClusterList,
+  V1alpha1AppProject
 } from '../types/argocd-types.js';
-import { HttpClient } from './http.js';
+import { HttpClient, TlsOptions } from './http.js';
 
 export class ArgoCDClient {
   private baseUrl: string;
   private apiToken: string;
   private client: HttpClient;
 
-  constructor(baseUrl: string, apiToken: string) {
+  constructor(baseUrl: string, apiToken: string, tls?: TlsOptions) {
     this.baseUrl = baseUrl;
     this.apiToken = apiToken;
-    this.client = new HttpClient(this.baseUrl, this.apiToken);
+    this.client = new HttpClient(this.baseUrl, this.apiToken, tls);
   }
 
   public async listApplications(params?: { search?: string; limit?: number; offset?: number }) {
@@ -85,6 +86,11 @@ export class ArgoCDClient {
       `/api/v1/applications/${applicationName}`,
       queryParams
     );
+    return body;
+  }
+
+  public async getAppProject(projectName: string) {
+    const { body } = await this.client.get<V1alpha1AppProject>(`/api/v1/projects/${projectName}`);
     return body;
   }
 

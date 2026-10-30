@@ -4,28 +4,117 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { logger } from '../logging/logging.js';
 import { createServer } from './server.js';
 import { randomUUID } from 'node:crypto';
+import type { AddressInfo } from 'node:net';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
+import { tokenRegistryFromEnv } from './tokenRegistry.js';
+import { tlsOptionsFromEnv } from './tlsOptions.js';
+import {
+  applyListenerSecurity,
+  resolveListenerSecurity,
+  type ListenerSecurityOptions
+} from './security.js';
+
+// Load the base-URL -> token registry once at startup from the JSON file at
+// ARGOCD_TOKEN_REGISTRY_PATH. Shared across all connections; read-only after
+// construction.
+const tokenRegistry = tokenRegistryFromEnv();
+
+// Outbound TLS options (mTLS client certificate, extra CA) for every ArgoCD
+// connection, loaded once at startup from the ARGOCD_CLIENT_* / ARGOCD_CA_CERT_PATH
+// env vars. Undefined when none are set.
+const argocdTls = tlsOptionsFromEnv();
 
 export const connectStdioTransport = () => {
   const server = createServer({
     argocdBaseUrl: process.env.ARGOCD_BASE_URL || '',
-    argocdApiToken: process.env.ARGOCD_API_TOKEN || ''
+    argocdApiToken: process.env.ARGOCD_API_TOKEN || '',
+    tokenRegistry,
+    argocdTls
   });
 
   logger.info('Connecting to stdio transport');
   server.connect(new StdioServerTransport());
 };
 
-export const connectSSETransport = (port: number) => {
+export type TransportOptions = ListenerSecurityOptions;
+
+// Liveness probe, registered before the security middleware: a kubelet probe
+// addresses the pod IP and carries no bearer token. Reports only that we are up.
+const registerHealthz = (app: express.Express) => {
+  app.get('/healthz', (_, res) => {
+    res.status(200).json({ status: 'ok' });
+  });
+};
+
+// Log the address actually bound, so an operator can see whether the listener is
+// loopback-only or exposed. Both handlers hang off events rather than
+// app.listen()'s callback, which Express invokes even when the bind fails, with
+// server.address() still null.
+const listen = (app: express.Express, bindAddress: string, port: number, label: string) => {
+  const server = app.listen(port, bindAddress);
+  server.on('listening', () => {
+    const { address, port: boundPort } = server.address() as AddressInfo;
+    logger.info(`${label} listening on ${address}:${boundPort}`);
+  });
+  server.on('error', (err: NodeJS.ErrnoException) => {
+    logger.error(`${label} could not bind ${bindAddress}:${port}: ${err.code ?? err.message}`);
+    process.exit(1);
+  });
+  return server;
+};
+
+// Resolve the session-level ArgoCD credentials from headers or env.
+//
+// The API token is only ever accepted here (x-argocd-api-token header or
+// ARGOCD_API_TOKEN env var) — never as a tool-call argument — so the secret
+// stays in the transport layer and out of prompts/model context.
+//
+// The token is normally MANDATORY and the connection is rejected when it is
+// missing. The exception is when a token registry (ARGOCD_TOKEN_REGISTRY_PATH)
+// is configured: the per-call base URL can then resolve its token from the
+// registry, so a tokenless connection is allowed.
+//
+// The base URL is optional at this level: when it is absent, callers may supply
+// it per call via the argocdBaseUrl tool argument.
+//
+// These are outbound credentials only. Inbound authorization is the listener's
+// job (MCP_AUTH_TOKEN, see security.ts).
+const resolveCredentials = (
+  req: express.Request,
+  res: express.Response
+): { argocdBaseUrl: string; argocdApiToken: string } | null => {
+  const argocdBaseUrl =
+    (req.headers['x-argocd-base-url'] as string) || process.env.ARGOCD_BASE_URL || '';
+  const argocdApiToken =
+    (req.headers['x-argocd-api-token'] as string) || process.env.ARGOCD_API_TOKEN || '';
+  if (!argocdApiToken && tokenRegistry.getSize() === 0) {
+    res
+      .status(400)
+      .send(
+        'x-argocd-api-token must be provided in the request header (or the ARGOCD_API_TOKEN env var), ' +
+          'or a token registry must be configured via ARGOCD_TOKEN_REGISTRY_PATH.'
+      );
+    return null;
+  }
+  return { argocdBaseUrl, argocdApiToken };
+};
+
+export const connectSSETransport = (options: TransportOptions) => {
+  const security = resolveListenerSecurity(options);
+  const { port } = options;
   const app = express();
+  registerHealthz(app);
+  applyListenerSecurity(app, security);
   const transports: { [sessionId: string]: SSEServerTransport } = {};
 
   app.get('/sse', async (req, res) => {
-    const server = createServer({
-      argocdBaseUrl: (req.headers['x-argocd-base-url'] as string) || '',
-      argocdApiToken: (req.headers['x-argocd-api-token'] as string) || ''
-    });
+    // Same credential requirement as the http transport. Without it the handler
+    // built an McpServer with empty credentials and held it until the socket
+    // closed, one per connection.
+    const credentials = resolveCredentials(req, res);
+    if (!credentials) return;
+    const server = createServer({ ...credentials, tokenRegistry, argocdTls });
 
     const transport = new SSEServerTransport('/messages', res);
     transports[transport.sessionId] = transport;
@@ -45,32 +134,18 @@ export const connectSSETransport = (port: number) => {
     }
   });
 
-  logger.info(`Connecting to SSE transport on port: ${port}`);
-  app.listen(port);
+  return listen(app, security.bindAddress, port, 'SSE transport');
 };
 
-const resolveCredentials = (
-  req: express.Request,
-  res: express.Response
-): { argocdBaseUrl: string; argocdApiToken: string } | null => {
-  const argocdBaseUrl =
-    (req.headers['x-argocd-base-url'] as string) || process.env.ARGOCD_BASE_URL || '';
-  const argocdApiToken =
-    (req.headers['x-argocd-api-token'] as string) || process.env.ARGOCD_API_TOKEN || '';
-  if (!argocdBaseUrl || !argocdApiToken) {
-    res.status(400).send('x-argocd-base-url and x-argocd-api-token must be provided in headers.');
-    return null;
-  }
-  return { argocdBaseUrl, argocdApiToken };
-};
-
-export const connectHttpTransport = (port: number, stateless = false) => {
+export const connectHttpTransport = (options: TransportOptions & { stateless?: boolean }) => {
+  const security = resolveListenerSecurity(options);
+  const { port, stateless = false } = options;
   const app = express();
+  registerHealthz(app);
+  applyListenerSecurity(app, security);
+  // After the security middleware, so malformed JSON returns 401/403 rather than
+  // the body parser's 400, which would tell a caller it passed the credential check.
   app.use(express.json());
-
-  app.get('/healthz', (_, res) => {
-    res.status(200).json({ status: 'ok' });
-  });
 
   const httpTransports: { [sessionId: string]: StreamableHTTPServerTransport } = {};
 
@@ -101,7 +176,7 @@ export const connectHttpTransport = (port: number, stateless = false) => {
         };
       }
 
-      const server = createServer(credentials);
+      const server = createServer({ ...credentials, tokenRegistry, argocdTls });
       await server.connect(transport);
     } else {
       const errorMsg = sessionIdFromHeader
@@ -134,8 +209,10 @@ export const connectHttpTransport = (port: number, stateless = false) => {
   app.get('/mcp', handleSessionRequest);
   app.delete('/mcp', handleSessionRequest);
 
-  logger.info(
-    `Connecting to Http Stream transport on port: ${port}${stateless ? ' (stateless mode)' : ''}`
+  return listen(
+    app,
+    security.bindAddress,
+    port,
+    `Http Stream transport${stateless ? ' (stateless mode)' : ''}`
   );
-  app.listen(port);
 };
