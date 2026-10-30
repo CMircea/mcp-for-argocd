@@ -1,23 +1,50 @@
+import { rootCertificates } from 'node:tls';
+import { Agent, Dispatcher } from 'undici';
+
 export interface HttpResponse<T> {
   status: number;
   headers: Headers;
   body: T;
 }
 
+export interface TlsOptions {
+  cert?: Buffer;
+  key?: Buffer;
+  pfx?: Buffer;
+  passphrase?: string;
+  ca?: Buffer;
+}
+
 type SearchParams = Record<string, string | number | boolean | undefined | null> | null;
+
+type NodeRequestInit = RequestInit & { dispatcher?: Dispatcher };
 
 export class HttpClient {
   public readonly baseUrl: string;
   public readonly apiToken: string;
   public readonly headers: Record<string, string>;
+  private readonly dispatcher?: Dispatcher;
 
-  constructor(baseUrl: string, apiToken: string) {
+  constructor(baseUrl: string, apiToken: string, tls?: TlsOptions) {
     this.baseUrl = baseUrl;
     this.apiToken = apiToken;
     this.headers = {
       Authorization: `Bearer ${this.apiToken}`,
       'Content-Type': 'application/json'
     };
+    if (tls && (tls.cert || tls.pfx || tls.ca)) {
+      this.dispatcher = new Agent({
+        connect: {
+          cert: tls.cert,
+          key: tls.key,
+          pfx: tls.pfx,
+          passphrase: tls.passphrase,
+          // A custom `ca` replaces Node's default trust store, so keep the
+          // bundled roots and add the extra CA on top of them.
+          ca: tls.ca ? [...rootCertificates, tls.ca] : undefined
+        }
+      });
+    }
   }
 
   private async request<R>(
@@ -33,8 +60,9 @@ export class HttpClient {
     }
     const response = await fetch(urlObject, {
       ...init,
-      headers: { ...init?.headers, ...this.headers }
-    });
+      headers: { ...init?.headers, ...this.headers },
+      ...(this.dispatcher ? { dispatcher: this.dispatcher } : {})
+    } as NodeRequestInit);
     const body = await response.json();
     return {
       status: response.status,
@@ -57,8 +85,9 @@ export class HttpClient {
     }
     const response = await fetch(urlObject, {
       ...init,
-      headers: { ...init?.headers, ...this.headers }
-    });
+      headers: { ...init?.headers, ...this.headers },
+      ...(this.dispatcher ? { dispatcher: this.dispatcher } : {})
+    } as NodeRequestInit);
     const reader = response.body?.getReader();
     if (!reader) {
       throw new Error('response body is not readable');

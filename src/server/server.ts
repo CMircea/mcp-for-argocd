@@ -2,6 +2,7 @@ import { McpServer, ToolCallback } from '@modelcontextprotocol/sdk/server/mcp.js
 
 import packageJSON from '../../package.json' with { type: 'json' };
 import { ArgoCDClient } from '../argocd/client.js';
+import { TlsOptions } from '../argocd/http.js';
 import { z, ZodRawShape } from 'zod';
 import { V1alpha1Application, V1alpha1ResourceResult } from '../types/argocd-types.js';
 import {
@@ -17,6 +18,9 @@ type ServerInfo = {
   // Optional registry mapping additional ArgoCD base URLs to their tokens. When
   // omitted, it is loaded from the ARGOCD_TOKEN_REGISTRY_PATH env var.
   tokenRegistry?: TokenRegistry;
+  // Optional outbound TLS options (client certificate, extra CA) applied to
+  // every ArgoCD connection, including per-call base URL overrides.
+  argocdTls?: TlsOptions;
 };
 
 // Per-call argument that any tool may accept to target a specific ArgoCD
@@ -44,6 +48,7 @@ export class Server extends McpServer {
   private defaultBaseUrl: string;
   private defaultApiToken: string;
   private tokenRegistry: TokenRegistry;
+  private argocdTls?: TlsOptions;
   private argocdClient: ArgoCDClient;
   // Cache per-credential clients to avoid rebuilding the HttpClient on every
   // call. Keyed by baseUrl + token, since the same base URL may resolve to
@@ -58,7 +63,12 @@ export class Server extends McpServer {
     this.defaultBaseUrl = serverInfo.argocdBaseUrl;
     this.defaultApiToken = serverInfo.argocdApiToken;
     this.tokenRegistry = serverInfo.tokenRegistry ?? tokenRegistryFromEnv();
-    this.argocdClient = new ArgoCDClient(serverInfo.argocdBaseUrl, serverInfo.argocdApiToken);
+    this.argocdTls = serverInfo.argocdTls;
+    this.argocdClient = new ArgoCDClient(
+      serverInfo.argocdBaseUrl,
+      serverInfo.argocdApiToken,
+      this.argocdTls
+    );
 
     const isReadOnly =
       String(process.env.MCP_READ_ONLY ?? '')
@@ -439,7 +449,7 @@ export class Server extends McpServer {
     const cacheKey = `${baseUrl} ${apiToken}`;
     let client = this.clientCache.get(cacheKey);
     if (!client) {
-      client = new ArgoCDClient(baseUrl, apiToken);
+      client = new ArgoCDClient(baseUrl, apiToken, this.argocdTls);
       this.clientCache.set(cacheKey, client);
     }
     return client;

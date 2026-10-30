@@ -8,6 +8,7 @@ import type { AddressInfo } from 'node:net';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import { tokenRegistryFromEnv } from './tokenRegistry.js';
+import { tlsOptionsFromEnv } from './tlsOptions.js';
 import {
   applyListenerSecurity,
   resolveListenerSecurity,
@@ -19,11 +20,17 @@ import {
 // construction.
 const tokenRegistry = tokenRegistryFromEnv();
 
+// Outbound TLS options (mTLS client certificate, extra CA) for every ArgoCD
+// connection, loaded once at startup from the ARGOCD_CLIENT_* / ARGOCD_CA_CERT_PATH
+// env vars. Undefined when none are set.
+const argocdTls = tlsOptionsFromEnv();
+
 export const connectStdioTransport = () => {
   const server = createServer({
     argocdBaseUrl: process.env.ARGOCD_BASE_URL || '',
     argocdApiToken: process.env.ARGOCD_API_TOKEN || '',
-    tokenRegistry
+    tokenRegistry,
+    argocdTls
   });
 
   logger.info('Connecting to stdio transport');
@@ -107,7 +114,7 @@ export const connectSSETransport = (options: TransportOptions) => {
     // closed, one per connection.
     const credentials = resolveCredentials(req, res);
     if (!credentials) return;
-    const server = createServer({ ...credentials, tokenRegistry });
+    const server = createServer({ ...credentials, tokenRegistry, argocdTls });
 
     const transport = new SSEServerTransport('/messages', res);
     transports[transport.sessionId] = transport;
@@ -169,7 +176,7 @@ export const connectHttpTransport = (options: TransportOptions & { stateless?: b
         };
       }
 
-      const server = createServer({ ...credentials, tokenRegistry });
+      const server = createServer({ ...credentials, tokenRegistry, argocdTls });
       await server.connect(transport);
     } else {
       const errorMsg = sessionIdFromHeader

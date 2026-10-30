@@ -151,6 +151,35 @@ This disables TLS certificate validation for Node.js when connecting to Argo CD 
 
 > **Warning**: Disabling SSL verification reduces security. Use this setting only in development environments or when you understand the security implications.
 
+### Mutual TLS (Client Certificates)
+
+If your Argo CD instance is fronted by a reverse proxy that enforces mutual TLS (mTLS) — for example, an ops gateway that requires every client to present a certificate — set the following environment variables. mTLS authenticates the transport and works alongside the existing `ARGOCD_API_TOKEN`, which still authenticates the Argo CD user.
+
+Supply the client identity in one of two ways:
+
+**PEM certificate + private key:**
+```
+"ARGOCD_CLIENT_CERT_PATH": "/path/to/client.crt",
+"ARGOCD_CLIENT_KEY_PATH": "/path/to/client.key"
+```
+
+**PKCS#12 bundle** (useful on Windows — export an exportable cert from `Cert:\CurrentUser\My` to a `.pfx` via `Export-PfxCertificate` and point at the file):
+```
+"ARGOCD_CLIENT_PFX_PATH": "C:\\path\\to\\client.pfx"
+```
+
+Optional, applies to either form:
+```
+"ARGOCD_CLIENT_KEY_PASSPHRASE": "<passphrase>",
+"ARGOCD_CA_CERT_PATH": "/path/to/ca.crt"
+```
+
+- `ARGOCD_CLIENT_KEY_PASSPHRASE` decrypts an encrypted PEM key or a password-protected PFX.
+- `ARGOCD_CA_CERT_PATH` adds a private CA on top of Node's default trusted CAs for Argo CD connections — prefer this over `NODE_TLS_REJECT_UNAUTHORIZED=0` when the issue is just an untrusted CA.
+
+These settings are read once at startup and apply to every Argo CD connection the server makes, including instances selected per call via `argocdBaseUrl` or the token registry. An incomplete configuration (for example, a certificate without its key) stops the server at startup.
+
+> Note: certificates cannot be loaded from the Windows certificate store directly by thumbprint. Node's TLS uses OpenSSL, not SChannel, and keys in `Cert:\CurrentUser\My` are commonly non-exportable (especially TPM- or smart-card-backed keys). Export to a PFX file first.
 
 ### Providing ArgoCD Credentials
 
